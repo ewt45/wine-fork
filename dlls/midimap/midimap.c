@@ -107,6 +107,7 @@ typedef	struct tagMIDIMAPDATA
 
 static	MIDIOUTPORT*	midiOutPorts;
 static  unsigned	numMidiOutPorts;
+// static  unsigned    idxAndroidPorts = -1; //记录安卓虚拟设备的序号。-1为不使用。
 
 static	BOOL	MIDIMAP_IsBadData(MIDIMAPDATA* mm)
 {
@@ -287,6 +288,7 @@ static DWORD modOpen(DWORD_PTR *lpdwUser, LPMIDIOPENDESC lpDesc, DWORD dwFlags)
 {
     MIDIMAPDATA*	mom = HeapAlloc(GetProcessHeap(), 0, sizeof(MIDIMAPDATA));
 
+    FIXME("dbgmidi: midimap->modOpen. should connect socket here?\n");
     TRACE("(%p %p %08lx)\n", lpdwUser, lpDesc, dwFlags);
 
     if (!mom) return MMSYSERR_NOMEM;
@@ -328,6 +330,8 @@ static	DWORD	modClose(MIDIMAPDATA* mom)
     UINT	i;
     DWORD	ret = MMSYSERR_NOERROR;
 
+    FIXME("dbgmidi: midimap->modClose. should disconnect socket?\n");
+
     if (MIDIMAP_IsBadData(mom)) 	return MMSYSERR_ERROR;
 
     for (i = 0; i < 16; i++)
@@ -357,6 +361,8 @@ static DWORD modLongData(MIDIMAPDATA* mom, LPMIDIHDR lpMidiHdr, DWORD_PTR dwPara
     WORD	chn;
     DWORD	ret = MMSYSERR_NOERROR;
     MIDIHDR	mh;
+
+    FIXME("dbgmidi: midimap->modLongData, maybe call midiOutLongMsg\n");
 
     if (MIDIMAP_IsBadData(mom))
 	return MMSYSERR_ERROR;
@@ -592,31 +598,50 @@ static LRESULT MIDIMAP_drvOpen(void)
     MIDIOUTCAPSW	moc;
     unsigned		dev, i;
     BOOL                found_valid_port = FALSE;
+    char            *androidDev;
+
+    FIXME("dbgmidi: midimap->drvOpen. will output no port found. should get env here.\n");
 
     if (midiOutPorts)
 	return 0;
 
+    if (!androidDev) androidDev = getenv("MIDIMAP_ANDROID_VIRTUAL_DEVICE");
     numMidiOutPorts = midiOutGetNumDevs();
+    if (androidDev) numMidiOutPorts ++; //如果变量存在则设备个数+1,下面分配数组大小要用到
     midiOutPorts = HeapAlloc(GetProcessHeap(), 0,
 			     numMidiOutPorts * sizeof(MIDIOUTPORT));
     for (dev = 0; dev < numMidiOutPorts; dev++)
     {
-	if (midiOutGetDevCapsW(dev, &moc, sizeof(moc)) == 0L)
-	{
-	    lstrcpyW(midiOutPorts[dev].name, moc.szPname);
-	    midiOutPorts[dev].loaded = 0;
-	    midiOutPorts[dev].hMidi = 0;
-	    midiOutPorts[dev].uDevID = dev;
-	    midiOutPorts[dev].lpbPatch = NULL;
-	    for (i = 0; i < 16; i++)
-		midiOutPorts[dev].aChn[i] = i;
+        if (androidDev && dev == numMidiOutPorts - 1) //尝试自己添加一个设备
+        {
+            dev = numMidiOutPorts;
+            // idxAndroidPorts = dev;
+            lstrcpyW(midiOutPorts[dev].name, L"android-virtual-device");
+            midiOutPorts[dev].loaded = 0;
+            midiOutPorts[dev].hMidi = 0;
+            midiOutPorts[dev].uDevID = dev;
+            midiOutPorts[dev].lpbPatch = NULL;
+            for (i = 0; i < 16; i++)
+                midiOutPorts[dev].aChn[i] = i;
+            found_valid_port = TRUE;
+            // numMidiOutPorts ++;
+        }
+        else if (midiOutGetDevCapsW(dev, &moc, sizeof(moc)) == 0L)
+        {
+            lstrcpyW(midiOutPorts[dev].name, moc.szPname);
+            midiOutPorts[dev].loaded = 0;
+            midiOutPorts[dev].hMidi = 0;
+            midiOutPorts[dev].uDevID = dev;
+            midiOutPorts[dev].lpbPatch = NULL;
+            for (i = 0; i < 16; i++)
+                midiOutPorts[dev].aChn[i] = i;
             if (wcsncmp(midiOutPorts[dev].name, L"Midi Through", lstrlenW(L"Midi Through")) != 0)
-	        found_valid_port = TRUE;
-	}
-	else
-	{
-	    midiOutPorts[dev].loaded = -1;
-	}
+                found_valid_port = TRUE;
+        }
+        else
+        {
+            midiOutPorts[dev].loaded = -1;
+        }
     }
 
     if (!found_valid_port)
@@ -630,6 +655,7 @@ static LRESULT MIDIMAP_drvOpen(void)
  */
 static LRESULT MIDIMAP_drvClose(void)
 {
+    FIXME("dbgmidi: midimap->drvClose. should clear env string here\n");
     if (midiOutPorts)
     {
 	HeapFree(GetProcessHeap(), 0, midiOutPorts);
