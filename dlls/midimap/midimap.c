@@ -107,6 +107,37 @@ typedef	struct tagMIDIMAPDATA
 
 static	MIDIOUTPORT*	midiOutPorts;
 static  unsigned	numMidiOutPorts;
+// static  unsigned    idxAndroidPorts = -1; //记录安卓虚拟设备的序号。-1为不使用。
+/*
+drvOpen 获取环境变量，建立socket连接
+modOpen 
+    - midiOutOpen 是winmm的函数。其调用最终会进入alsa驱动 winealsa 的 midi_out_open
+      但是安卓上alsa不支持midi，所以应该将midiOutOpen去掉，改为建立socket连接。
+modData 通过socket发送数据
+    - 这里会调用midiOutShortMsg。改成自己的函数，midiOut要不要删掉？
+modReset 退出比赛时好像会调用，停止播放。
+    - 这里调用midiOutReset，根据alsamidi，其内部其实也是调用modData发送控制器参数
+    - 实现了这个之后，退出比赛不会报错了
+drvClose 断开socket连接
+
+发送socket数据时，第一个byte放TYPE，后三个byte放evt，d1和d2（经过处理，参考alsamidi的midi_out_data）
+*/
+
+#include <winsock2.h>
+
+#define TYPE_ON_CONNECT      0x12 //初始连接成功时
+#define TYPE_SHORT_MSG       0x13 //midiOutShortMsg时
+//复制自asoundef.h
+#define MIDI_CMD_CONTROL		    0xb0	/**< control change */
+#define MIDI_CTL_SUSTAIN            0x40	/**< Sustain pedal */
+#define MIDI_CTL_ALL_SOUNDS_OFF		0x78	/**< All sounds off */
+
+static char *androidPort = NULL; //记录socket端口号，字符串
+static SOCKET connectSocket = INVALID_SOCKET;
+static void connect_socket();
+static void disconnect_socket();
+static DWORD send_socket_data(MIDIMAPDATA*, DWORD_PTR);
+static DWORD send_socket_long_data(DWORD_PTR);
 
 static	BOOL	MIDIMAP_IsBadData(MIDIMAPDATA* mm)
 {
@@ -307,6 +338,13 @@ static DWORD modOpen(DWORD_PTR *lpdwUser, LPMIDIOPENDESC lpDesc, DWORD dwFlags)
 	for (chn = 0; chn < 16; chn++)
 	{
 	    if (mom->ChannelMap[chn]->loaded) continue;
+            //midiOutOpen不会成功，因为alsa找不到seq。所以需要手动创建socket连接并初始化对应内容。(参考alsamidi.c midi_out_open())
+            if (androidPort) {
+                FIXME("midi调试 安卓没有alsa_seq, midiOutOpen不成功。我们手动初始化。\n");
+                if(midiOutPorts[0].hMidi != 0) FIXME("midi调试 手动初始化有潜在问, hMidi不为0!\n");
+                mom->ChannelMap[chn]->loaded = 1;
+                continue;
+            }
 	    if (midiOutOpen(&mom->ChannelMap[chn]->hMidi, mom->ChannelMap[chn]->uDevID,
 			    0L, 0L, CALLBACK_NULL) == MMSYSERR_NOERROR)
 		mom->ChannelMap[chn]->loaded = 1;
@@ -358,6 +396,7 @@ static DWORD modLongData(MIDIMAPDATA* mom, LPMIDIHDR lpMidiHdr, DWORD_PTR dwPara
     DWORD	ret = MMSYSERR_NOERROR;
     MIDIHDR	mh;
 
+    TRACE("midi调试 播放长消息\n");
     if (MIDIMAP_IsBadData(mom))
 	return MMSYSERR_ERROR;
     if (!(lpMidiHdr->dwFlags & MHDR_PREPARED))
@@ -439,7 +478,9 @@ static DWORD modData(MIDIMAPDATA* mom, DWORD_PTR dwParam)
 		dwParam &= ~0x0000FF00;
 		dwParam |= mom->ChannelMap[chn]->lpbPatch[patch];
 	    }
-	    ret = midiOutShortMsg(mom->ChannelMap[chn]->hMidi, dwParam);
+            ret = androidPort 
+                ? send_socket_data(mom, dwParam) 
+                : midiOutShortMsg(mom->ChannelMap[chn]->hMidi, dwParam);
 	}
 	mom->runningStatus = status;
 	break;
@@ -447,7 +488,9 @@ static DWORD modData(MIDIMAPDATA* mom, DWORD_PTR dwParam)
 	for (chn = 0; chn < 16; chn++)
 	{
 	    if (mom->ChannelMap[chn]->loaded > 0)
-		ret = midiOutShortMsg(mom->ChannelMap[chn]->hMidi, dwParam);
+                ret = androidPort 
+                    ? send_socket_data(mom, dwParam)
+                    : midiOutShortMsg(mom->ChannelMap[chn]->hMidi, dwParam);
 	}
 	/* system common message */
 	if (status <= 0xF7)
@@ -529,6 +572,11 @@ static	DWORD	modReset(MIDIMAPDATA* mom)
     {
 	if (mom->ChannelMap[chn] && mom->ChannelMap[chn]->loaded > 0)
 	{
+        if (androidPort) { //参考alsamidi.c的midi_out_reset
+            modData(mom, (MIDI_CTL_ALL_SOUNDS_OFF << 8) | MIDI_CMD_CONTROL | chn); /* turn off every note */
+            modData(mom, (MIDI_CTL_SUSTAIN << 8) | MIDI_CMD_CONTROL | chn); /* remove sustain on all channels */
+            continue;
+        }
 	    ret = midiOutReset(mom->ChannelMap[chn]->hMidi);
 	    if (ret != MMSYSERR_NOERROR) break;
 	}
@@ -596,6 +644,28 @@ static LRESULT MIDIMAP_drvOpen(void)
     if (midiOutPorts)
 	return 0;
 
+    if (!androidPort) 
+        androidPort = getenv("MIDI_SOCKET_PORT");
+    FIXME("midi调试 获取到的环境变量值为%s\n", androidPort);
+
+    if (androidPort) 
+    {
+        // numMidiOutPorts ++; //如果变量存在则设备个数+1,下面分配数组大小要用到
+        numMidiOutPorts = 1; //直接设置成只有1个设备
+        midiOutPorts = HeapAlloc(GetProcessHeap(), 0, numMidiOutPorts * sizeof(MIDIOUTPORT));
+
+        lstrcpyW(midiOutPorts[0].name, L"android-virtual-device");
+        midiOutPorts[0].loaded = 0;
+        midiOutPorts[0].hMidi = 0;
+        midiOutPorts[0].uDevID = dev;
+        midiOutPorts[0].lpbPatch = NULL;
+        for (i = 0; i < 16; i++)
+            midiOutPorts[0].aChn[i] = i;
+
+        connect_socket(); //在此处建立socket连接
+        return 1;
+    }
+
     numMidiOutPorts = midiOutGetNumDevs();
     midiOutPorts = HeapAlloc(GetProcessHeap(), 0,
 			     numMidiOutPorts * sizeof(MIDIOUTPORT));
@@ -632,6 +702,8 @@ static LRESULT MIDIMAP_drvClose(void)
 {
     if (midiOutPorts)
     {
+        if (androidPort) //断开socket
+            disconnect_socket();
 	HeapFree(GetProcessHeap(), 0, midiOutPorts);
 	midiOutPorts = NULL;
 	return 1;
@@ -663,4 +735,121 @@ LRESULT CALLBACK MIDIMAP_DriverProc(DWORD_PTR dwDevID, HDRVR hDriv, UINT wMsg,
     default:
 	return DefDriverProc(dwDevID, hDriv, wMsg, dwParam1, dwParam2);
     }
+}
+
+/*
+疑问：
+1. IPPROTO_TCP 这里用tcp没问题吗？要不要用0
+2. WSACleanup。 好像是卸载dll，所有线程上的socket全部断开，好像会影响到其他的？
+3. connectSocket是否需要手动释放内存？
+
+参考：
+https://learn.microsoft.com/en-us/windows/win32/winsock
+*/
+static void connect_socket() {
+    if(connectSocket != INVALID_SOCKET)
+        return;
+
+    WSADATA wsaData;
+    
+    struct sockaddr_in serverAddr;
+    int result;
+    char* serverIP = "127.0.0.1"; // 服务器 IP 地址
+    int serverPort = atoi(androidPort);        // 服务器端口
+    if(!serverPort) serverPort = 43456;
+    
+    // 初始化 Winsock
+    result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        ERR("midi调试 WSAStartup failed: %d\n", result);
+        return;
+    }
+
+    // 创建 Socket
+    connectSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); 
+    if (connectSocket == INVALID_SOCKET) {
+        ERR("midi调试 Socket creation failed: %ld\n", WSAGetLastError());
+        WSACleanup();
+        return;
+    }
+
+    // 设置服务器地址信息
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(serverPort);
+    serverAddr.sin_addr.s_addr = inet_addr(serverIP);
+    memset(serverAddr.sin_zero, 0X00, 8); 
+
+    // 连接到服务器
+    result = connect(connectSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+    if (result == SOCKET_ERROR) {
+        ERR("midi调试 Connection failed: %ld\n", WSAGetLastError());
+        closesocket(connectSocket);
+        WSACleanup();
+        connectSocket = INVALID_SOCKET;
+        return;
+    }
+
+    FIXME("midi调试 与服务器建立socket成功 -- %s:%d", serverIP, serverPort);
+
+    return 0;
+}
+
+static void disconnect_socket() {
+    // 关闭连接
+    closesocket(connectSocket);
+    WSACleanup();
+    connectSocket = INVALID_SOCKET;
+}
+
+static DWORD send_socket_data(MIDIMAPDATA *dest, DWORD_PTR data) {
+    if(connectSocket == INVALID_SOCKET)
+        return MMSYSERR_NOERROR;
+
+    char buf[5];
+    BYTE evt = LOBYTE(LOWORD(data)), d1, d2; //evt=1,2位，d1=3,4位，d2=5,6位
+    // struct midi_dest *dest;
+
+    if (evt & 0x80)
+    {
+        d1 = HIBYTE(LOWORD(data));
+        d2 = LOBYTE(HIWORD(data));
+    }
+    else if (dest->runningStatus)
+    {
+        evt = dest->runningStatus;
+        d1 = LOBYTE(LOWORD(data));
+        d2 = HIBYTE(LOWORD(data));
+    }
+    else
+    {
+        FIXME("ooch %x\n", data);
+        return MMSYSERR_NOERROR;
+    }
+
+
+    //手动格式化,低位在前高为在后,8位一个char,第5个写'\0'
+    buf[0] = TYPE_SHORT_MSG;
+    buf[1] = evt;
+    buf[2] = d1;
+    buf[3] = d2;
+    buf[4] = '\0';
+
+    TRACE("midi调试 socket发送短消息。data=%08x\n", data);
+
+    // 发送数据
+    if (send(connectSocket, buf, 4, 0) == SOCKET_ERROR) {
+        ERR("Send failed: %ld\n", WSAGetLastError());
+    }
+
+    return MMSYSERR_NOERROR;
+}
+
+static DWORD send_socket_long_data() {
+    if(connectSocket == INVALID_SOCKET)
+        return MMSYSERR_NOERROR;
+
+    FIXME("midi调试 开始通过socket发送长消息数据(尚未实现). dwParam=\n");
+    
+
+    return MMSYSERR_NOERROR;
 }
